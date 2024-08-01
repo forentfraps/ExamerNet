@@ -1,3 +1,16 @@
+# Debugger
+
+*.id*
+*.nam
+*.til
+*.i64
+
+
+#zig
+.zig-cache/
+.zig-out/
+
+
 # Prerequisites
 *.d
 
