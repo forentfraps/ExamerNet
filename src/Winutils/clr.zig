@@ -38,3 +38,50 @@ pub fn isFullPath(utf16: []const u16) ?u16 {
     }
     return null;
 }
+
+pub fn print16(s: anytype) void {
+    var i: usize = 0;
+    while (s[i] != 0) : (i += 1) {
+        const c: u8 = @intCast(s[i]);
+        std.debug.print("{c}", .{c});
+    }
+    std.debug.print("\n", .{});
+}
+
+pub fn looksLikeAscii(possible_str: []const u8) bool {
+    for (possible_str) |c| {
+        if (c < ' ' or c > 'z' or c == '@') {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn screwApiSets(possible_apiset: []const u16) bool {
+    const pattern: *const [10:0]u8 = "api-ms-win";
+    if (possible_apiset.len < 10) {
+        return false;
+    }
+
+    for (possible_apiset, 0..) |wc, i| {
+        if (i >= 9) {
+            return true;
+        }
+        if (wc & 0xff00 != 0) {
+            return false;
+        }
+        const c: u8 = @intCast(wc);
+        if (c != pattern[i]) {
+            return false;
+        }
+    }
+    return false;
+}
+
+pub fn findExportRealName(fname: [*]const u8) ?[]const u8 {
+    const len = std.mem.len(@as([*:0]const u8, @ptrCast(fname)));
+    for (fname[0..len], 0..) |c, i| {
+        if (c == '.') return fname[i + 1 .. len];
+    }
+    return null;
+}

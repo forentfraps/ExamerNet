@@ -2,17 +2,26 @@ const std = @import("std");
 const dll = @import("Winutils/dll.zig");
 const clr = @import("Winutils/clr.zig");
 const sneaky_memory = @import("Winutils/memory.zig");
+const logger = @import("Logger/logger.zig").Logger;
+
 const win = std.os.windows;
 const lstring = clr.lstring;
-pub fn main() !void {
-    const ptr: [*]u8 = @ptrFromInt(0x180000000);
-    _ = try win.VirtualAlloc(
-        ptr,
-        512,
-        win.MEM_RESERVE | win.MEM_COMMIT,
-        win.PAGE_EXECUTE_READWRITE,
-    );
 
+const dllLoggerInterface = struct {
+    pref_list: [][]const u8 = .{ "RefLoad", "ExpTable", "ImpFix", "ImpRes", "RVAres" },
+
+    pub fn get(ind: usize) []const u8 {
+        return dllLoggerInterface.pref_list[ind];
+    }
+};
+
+const logtags = enum {
+    RefLoad,
+    ExpTable,
+    ImpFix,
+};
+
+pub fn main() !void {
     std.debug.print("Starting to ref load dll\n", .{});
     var DllLoader: dll.DllLoader = undefined;
     {
@@ -26,8 +35,11 @@ pub fn main() !void {
 
         std.debug.print("space used: {d}% leaving scope\n", .{100 * fba.end_index / (1024000)});
     }
-    const kernel32 = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "KERNEL32.DLL")).?.NameExports;
-    const ntdll = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "ntdll.dll")).?.NameExports;
+    var kernel32_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "KERNEL32.DLL")).?;
+    var kernelbase_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "KERNELBASE.dll")).?;
+    var ntdll_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "ntdll.dll")).?;
+    var kernel32 = kernel32_m.NameExports;
+    var ntdll = ntdll_m.NameExports;
     const pHeapCreate = kernel32.get("HeapCreate") orelse return dll.DllError.FuncResolutionFailed;
     const pHeapAlloc = ntdll.get("RtlAllocateHeap") orelse return dll.DllError.FuncResolutionFailed;
     const pHeapRealloc = ntdll.get("RtlReAllocateHeap") orelse return dll.DllError.FuncResolutionFailed;
@@ -57,7 +69,27 @@ pub fn main() !void {
     DllLoader.LoadedDlls = newLoadedDlls;
     DllLoader.Allocator = newallocator;
     DllLoader.HeapAllocator = HeapAllocator;
+    dll.GLOBAL_DLL_LOADER = &DllLoader;
+    kernel32_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "KERNEL32.DLL")).?;
+    kernelbase_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "KERNELBASE.dll")).?;
+    ntdll_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "ntdll.dll")).?;
+    kernel32 = kernel32_m.NameExports;
+    ntdll = ntdll_m.NameExports;
+    try DllLoader.ResolveImportInconsistencies(kernel32_m, 8);
+
+    try DllLoader.ResolveImportInconsistencies(kernelbase_m, 10);
+
+    std.debug.print("/// ExitThread BaseAddr: {*}\n", .{kernel32.get("ExitThread").?});
+    // if (true) return;
+    std.debug.print("Resolved import inconsistancies\n", .{});
+    const ucrt_s = try lstring(DllLoader.Allocator, "ucrtbase.dll");
+    _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(ucrt_s)));
     const user32_s = try lstring(DllLoader.Allocator, "user32.dll");
     _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(user32_s)));
+
+    const user32 = DllLoader.LoadedDlls.get(user32_s).?.NameExports;
+    const MessageBoxW: *const fn (?*void, [*]const u16, [*]const u16, u64) c_int = @ptrCast(user32.get("MessageBoxW") orelse return dll.DllError.FuncResolutionFailed);
+    _ = MessageBoxW(null, (try clr.lstring(DllLoader.Allocator, "Text")).ptr, (try clr.lstring(DllLoader.Allocator, "Text2")).ptr, 0);
+
     std.debug.print("Scope left fin!\n", .{});
 }
