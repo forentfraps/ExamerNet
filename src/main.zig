@@ -3,6 +3,7 @@ const dll = @import("Winutils/dll.zig");
 const clr = @import("Winutils/clr.zig");
 const sneaky_memory = @import("Winutils/memory.zig");
 const logger = @import("Logger/logger.zig").Logger;
+const winc = @import("Winutils/Windows.h.zig");
 
 const win = std.os.windows;
 const lstring = clr.lstring;
@@ -75,19 +76,31 @@ pub fn main() !void {
     ntdll_m = DllLoader.LoadedDlls.get(try lstring(DllLoader.Allocator, "ntdll.dll")).?;
     kernel32 = kernel32_m.NameExports;
     ntdll = ntdll_m.NameExports;
-    try DllLoader.ResolveImportInconsistencies(kernel32_m, 8);
 
-    try DllLoader.ResolveImportInconsistencies(kernelbase_m, 10);
+    try DllLoader.ResolveImportInconsistencies(kernelbase_m);
+    try DllLoader.ResolveImportInconsistencies(kernel32_m);
 
-    std.debug.print("/// ExitThread BaseAddr: {*}\n", .{kernel32.get("ExitThread").?});
     // if (true) return;
-    std.debug.print("Resolved import inconsistancies\n", .{});
-    const ucrt_s = try lstring(DllLoader.Allocator, "ucrtbase.dll");
-    _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(ucrt_s)));
-    const user32_s = try lstring(DllLoader.Allocator, "user32.dll");
-    _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(user32_s)));
 
+    const ws2_32_s = try lstring(DllLoader.Allocator, "Ws2_32.dll");
+    _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(ws2_32_s)));
+
+    const ws2_32 = DllLoader.LoadedDlls.get(ws2_32_s).?.NameExports;
+    const WSAStartup: *const fn (winc.WORD, *winc.WSADATA) c_int = @ptrCast(ws2_32.get("WSAStartup") orelse return dll.DllError.FuncResolutionFailed);
+    var wsaData: winc.WSADATA = undefined;
+    std.debug.print("WSAStartup value: {d}\n", .{WSAStartup(winc.MAKEWORD(2, 2), &wsaData)});
+
+    //const ucrtbase_s = try lstring(DllLoader.Allocator, "ucrtbase.dll");
+    //_ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(ucrtbase_s)));
+    //
+    //const gdi32full_s = try lstring(DllLoader.Allocator, "gdi32full.dll");
+    //_ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(gdi32full_s)));
+    //
+    const user32_s = try lstring(DllLoader.Allocator, "USER32.dll");
+    _ = try DllLoader.ReflectiveLoad(@as([:0]const u16, @ptrCast(user32_s)));
+    std.debug.print("user32 looaded!\n", .{});
     const user32 = DllLoader.LoadedDlls.get(user32_s).?.NameExports;
+
     const MessageBoxW: *const fn (?*void, [*]const u16, [*]const u16, u64) c_int = @ptrCast(user32.get("MessageBoxW") orelse return dll.DllError.FuncResolutionFailed);
     _ = MessageBoxW(null, (try clr.lstring(DllLoader.Allocator, "Text")).ptr, (try clr.lstring(DllLoader.Allocator, "Text2")).ptr, 0);
 

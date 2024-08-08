@@ -2,8 +2,12 @@ const std = @import("std");
 const win = @import("std").os.windows;
 const clr = @import("clr.zig");
 const sneaky_memory = @import("memory.zig");
-
+const logger = @import("../Logger/logger.zig");
 const winc = @import("Windows.h.zig");
+
+extern fn UniversalStub() void;
+
+//const UniversalStubPtr: usize = @intFromPtr(&UniversalStub);
 
 const BASE_RELOCATION_BLOCK = struct {
     PageAddress: u32,
@@ -79,9 +83,10 @@ const PEB = extern struct {
 };
 const print16 = clr.print16;
 
-const logger = @import("../Logger/logger.zig");
-
 const pref_list = [_][]const u8{ "RefLoad", "ExpTable", "ImpFix", "ImpRes", "RVAres", "HookF" };
+
+const colour = logger.LoggerColour;
+const colour_list = [_]colour{ colour.green, colour.blue, colour.cyan, colour.yellow, colour.pink, colour.red };
 
 const logtags = enum {
     RefLoad,
@@ -92,7 +97,7 @@ const logtags = enum {
     HookF,
 };
 
-var log = logger.Logger.init(6, pref_list);
+var log = logger.Logger.init(6, pref_list, colour_list);
 
 pub const Dll = struct {
     NameExports: std.StringHashMap(*void) = undefined,
@@ -108,6 +113,9 @@ pub const Dll = struct {
 pub var GLOBAL_DLL_LOADER: *DllLoader = undefined;
 
 pub fn GetProcAddress(hModule: [*]u8, procname: [*:0]const u8) callconv(.C) ?*void {
+    log.setContext(logtags.HookF);
+    defer log.rollbackContext();
+    log.info("[+] Hit GPA {s}\n", .{procname});
     const self = GLOBAL_DLL_LOADER;
     var it = self.LoadedDlls.keyIterator();
     return outer: while (true) {
@@ -125,7 +133,9 @@ pub fn GetProcAddress(hModule: [*]u8, procname: [*:0]const u8) callconv(.C) ?*vo
 }
 
 pub fn GetModuleHandleA(moduleName: [*:0]const u8) callconv(.C) ?[*]u8 {
-    print("[+] Hit GMHA {s}\n", .{moduleName});
+    log.setContext(logtags.HookF);
+    defer log.rollbackContext();
+    log.info("[+] Hit GMHA {s}\n", .{moduleName});
     const self = GLOBAL_DLL_LOADER;
     var utf16name: [*:0]u16 = @ptrCast(clr.lstring(self.Allocator, moduleName[0 .. std.mem.len(moduleName) + 1]) catch return null);
     var it = self.LoadedDlls.keyIterator();
@@ -135,13 +145,31 @@ pub fn GetModuleHandleA(moduleName: [*:0]const u8) callconv(.C) ?[*]u8 {
                 break :outer self.LoadedDlls.get(key.*).?.BaseAddr;
             }
         } else {
-            print("Doing the unthinkable to {s}\n", .{moduleName});
-
-            return null;
-
+            if (true) return null;
             //Think twice, warrior
-            //break :outer self.ReflectiveLoad(@as([:0]u16, @ptrCast(utf16name[0 .. std.mem.len(moduleName) + 1]))) catch null;
-
+            log.crit("Doing the unthinkable to {s}\n", .{moduleName});
+            break :outer self.ReflectiveLoad(@as([:0]u16, @ptrCast(utf16name[0 .. std.mem.len(moduleName) + 1]))) catch null;
+        }
+    };
+}
+pub fn GetModuleHandleW(moduleName16: [*:0]const u16) callconv(.C) ?[*]u8 {
+    //TODO Parse long path into short one
+    log.setContext(logtags.HookF);
+    defer log.rollbackContext();
+    const len = std.mem.len(moduleName16);
+    log.info16("[+] Hit GMHW \n", .{}, moduleName16[0..len]);
+    const self = GLOBAL_DLL_LOADER;
+    var it = self.LoadedDlls.keyIterator();
+    return outer: while (true) {
+        if (it.next()) |key| {
+            if (std.mem.eql(u16, key.*, moduleName16[0..std.mem.len(moduleName16)])) {
+                break :outer self.LoadedDlls.get(key.*).?.BaseAddr;
+            }
+        } else {
+            if (true) return null;
+            //Think twice, warrior
+            log.crit16("Doing the unthinkable to \n", .{}, moduleName16);
+            break :outer self.ReflectiveLoad(@as([:0]u16, @ptrCast(moduleName16[0 .. len + 1]))) catch null;
         }
     };
 }
@@ -221,7 +249,11 @@ pub const DllLoader = struct {
         return;
     }
 
-    pub fn ResolveImportInconsistencies(self: *DllLoader, dll: *Dll, _: usize) !void {
+    pub fn ResolveImportInconsistencies(self: *DllLoader, dll: *Dll) !void {
+        log.setContext(logtags.ImpFix);
+        defer log.rollbackContext();
+
+        log.crit16("Patching", .{}, dll.Path[0..std.mem.len(dll.Path)]);
         // Call After heap allocator init, a lot of stuff to allocate
 
         //const dll_base = dll.BaseAddr;
@@ -238,6 +270,9 @@ pub const DllLoader = struct {
         if (dll.NameExports.get("GetModuleHandleA")) |_| {
             try dll.NameExports.put("GetModuleHandleA", @as(*void, @ptrCast(@constCast(&GetModuleHandleA))));
         }
+        if (dll.NameExports.get("GetModuleHandleW")) |_| {
+            try dll.NameExports.put("GetModuleHandleW", @as(*void, @ptrCast(@constCast(&GetModuleHandleW))));
+        }
         var efit = dll.NameExports.keyIterator();
         import_cycle: while (true) {
             if (efit.next()) |fptr| {
@@ -246,7 +281,14 @@ pub const DllLoader = struct {
                     continue;
                 }
 
-                const exportFname = if (clr.findExportRealName(faddr)) |ename| ename else fptr.*;
+                var exportFname: []const u8 = undefined;
+                if (clr.findExportRealName(faddr)) |ename| {
+                    exportFname = ename;
+                } else {
+                    exportFname = fptr.*;
+                }
+
+                var dll_nameexports = dll.NameExports;
 
                 var it = self.LoadedDlls.keyIterator();
                 while (true) {
@@ -257,9 +299,8 @@ pub const DllLoader = struct {
                         var some_random_dll = self.LoadedDlls.get(key.*).?.NameExports;
 
                         if (some_random_dll.get(exportFname)) |func_addr| {
-                            //print("Patched export {s}\n", .{fptr.*});
-                            const ptr: **void = dll.NameExports.getPtr(fptr.*).?;
-                            ptr.* = func_addr;
+                            log.info("Patched export {s}\n", .{fptr.*});
+                            try dll_nameexports.put(fptr.*, func_addr);
 
                             continue :import_cycle;
                         }
@@ -274,6 +315,9 @@ pub const DllLoader = struct {
     }
 
     pub fn ResolveExports(self: *DllLoader, dll: *Dll) !void {
+        log.setContext(logtags.ExpTable);
+        defer log.rollbackContext();
+        log.crit16("resolving", .{}, dll.Path[0..std.mem.len(dll.Path)]);
         // Please call this funciton after defining BaseAddr of the dll
         const dll_bytes: [*]u8 = dll.BaseAddr;
         const dos_headers: *winc.IMAGE_DOS_HEADER = @ptrCast(@alignCast(dll_bytes));
@@ -300,8 +344,9 @@ pub const DllLoader = struct {
             //ordinal_high = ord_u8arr[0];
             //ordinal = (@as(u16, @intCast(ordinal_high)) << 0x8) | (@as(u16, @intCast(ordinal_low)));
             const fptr: *void = @ptrCast(dll_bytes[@as(usize, @intCast(exportAddressTable[ordinal]))..]);
-            const fbytes: [*]const u8 = @ptrCast(fptr);
-            if (clr.looksLikeAscii(fbytes[0..10])) {
+            const fbytes: [*:0]const u8 = @ptrCast(fptr);
+            if (clr.looksLikeAscii(fbytes[0..11])) {
+                log.info("Function {s} looks like ascii ptr: {*} asci:{s}\n", .{ funcname, fptr, fbytes[0..std.mem.len(fbytes)] });
                 //print("This function is blank {s}\n", .{funcname});
             }
 
@@ -315,7 +360,7 @@ pub const DllLoader = struct {
 
     pub fn ReflectiveLoad(self: *DllLoader, libname16_: [:0]const u16) anyerror!?[*]u8 {
         log.setContext(logtags.RefLoad);
-        log.crit("Starting to load dll\n", .{});
+        defer log.rollbackContext();
 
         const kernel32_s = try lstring(self.Allocator, "KERNEL32.DLL");
         defer self.Allocator.free(kernel32_s);
@@ -414,6 +459,8 @@ pub const DllLoader = struct {
             return null;
         }
 
+        log.info16("Starting to load valid dll", .{}, shortlibpath16);
+
         // load DLL into memory
         const pathlen = libpath16.len;
         var dll_struct: *Dll = try self.Allocator.create(Dll);
@@ -449,16 +496,32 @@ pub const DllLoader = struct {
         const dos_headers: *winc.IMAGE_DOS_HEADER = @ptrCast(@alignCast(dll_bytes));
         const lfanewoffset: usize = @intCast(dos_headers.e_lfanew);
         const nt_headers: *const winc.IMAGE_NT_HEADERS = @ptrCast(@alignCast(dll_bytes[lfanewoffset..]));
-        const dll_image_size = nt_headers.OptionalHeader.SizeOfImage;
+        //const dll_image_size = nt_headers.OptionalHeader.SizeOfImage;
 
         // allocate new memory space for the DLL
 
         // TODO clean stackframe calls to dangerous functions
         //
         // TODO Never have RWX memory, should be RW then RX
-        var dll_base_dirty: ?[*]u8 = @ptrFromInt(nt_headers.OptionalHeader.ImageBase);
-        var virtAllocSize: usize = dll_image_size;
+        //var dll_base_dirty: ?[*]u8 = @ptrFromInt(nt_headers.OptionalHeader.ImageBase);
+        var dll_base_dirty: ?[*]u8 = null;
 
+        var section_index: usize = 0;
+        var section: [*]const winc.IMAGE_SECTION_HEADER = @ptrCast(@alignCast(dll_bytes[(lfanewoffset + @sizeOf(winc.IMAGE_NT_HEADERS))..]));
+
+        var end_size_resolution: usize = 0;
+        while (section_index < nt_headers.FileHeader.NumberOfSections) {
+            const cur_section = section[0];
+
+            end_size_resolution = cur_section.VirtualAddress + cur_section.VirtualAddress;
+            section_index += 1;
+
+            section = section[1..];
+        }
+
+        var virtAllocSize: usize = end_size_resolution;
+
+        log.info("VirtAllocSize {x}\n", .{virtAllocSize});
         var ntRes: c_int = VirtualAlloc(
             -1,
             &dll_base_dirty,
@@ -468,6 +531,7 @@ pub const DllLoader = struct {
             win.PAGE_EXECUTE_READWRITE,
         );
         if (ntRes < 0) {
+            log.info("TRY 2 VirtAllocSize {x}\n", .{virtAllocSize});
             dll_base_dirty = null;
             ntRes = VirtualAlloc(
                 -1,
@@ -478,55 +542,82 @@ pub const DllLoader = struct {
                 win.PAGE_EXECUTE_READWRITE,
             );
         }
+
+        log.info("REsulting VirtAllocSize {x}\n", .{virtAllocSize});
         const dll_base = dll_base_dirty.?;
         dll_struct.BaseAddr = dll_base;
         // get delta between this module's image base and the DLL that was read into memory
         const delta_image_base = @intFromPtr(dll_base) - nt_headers.OptionalHeader.ImageBase;
 
+        log.info("Size of headers {x}\n", .{nt_headers.OptionalHeader.SizeOfHeaders});
         // copy over DLL image headers to the newly allocated space for the DLL
         std.mem.copyForwards(u8, dll_base[0..nt_headers.OptionalHeader.SizeOfHeaders], dll_bytes[0..nt_headers.OptionalHeader.SizeOfHeaders]);
 
         // copy over DLL image sections to the newly allocated space for the DLL
-        var section_index: usize = 0;
-        var section: *const winc.IMAGE_SECTION_HEADER = @ptrCast(@alignCast(dll_bytes[(lfanewoffset + @sizeOf(winc.IMAGE_NT_HEADERS))..]));
-        while (section_index < nt_headers.FileHeader.NumberOfSections) {
-            const section_destination: [*]u8 = @ptrCast(dll_base[section.VirtualAddress..]);
-            const section_bytes: [*]u8 = @ptrCast(dll_bytes[section.PointerToRawData..]);
-            std.mem.copyForwards(u8, section_destination[0..section.SizeOfRawData], section_bytes[0..section.SizeOfRawData]);
-            section = @ptrFromInt(@intFromPtr(section) + @sizeOf(winc.IMAGE_SECTION_HEADER));
-            section_index += 1;
+        log.info("delta image base {x} dll_base {*} image_base {x} dll_size {x}\n", .{
+            delta_image_base,
+            dll_base,
+            nt_headers.OptionalHeader.ImageBase,
+            virtAllocSize,
+        });
+        section_index = 0;
+        section = @ptrCast(@alignCast(dll_bytes[(lfanewoffset + @sizeOf(winc.IMAGE_NT_HEADERS))..]));
+
+        for (0..nt_headers.FileHeader.NumberOfSections) |_| {
+            const cur_section = section[0];
+            const section_destination: [*]u8 = @ptrCast(dll_base[cur_section.VirtualAddress..]);
+            const section_bytes: [*]u8 = @ptrCast(dll_bytes[cur_section.PointerToRawData..]);
+            std.mem.copyForwards(
+                u8,
+                section_destination[0..cur_section.SizeOfRawData],
+                section_bytes[0..cur_section.SizeOfRawData],
+            );
+            section = section[1..];
+            log.info("Copying section to {*} to {*}\n", .{
+                dll_base[cur_section.VirtualAddress..],
+                dll_base[cur_section.VirtualAddress + cur_section.VirtualAddress ..],
+            });
         }
 
         // perform image base relocations
+
+        log.setContext(logtags.RVAres);
         const relocations = nt_headers.OptionalHeader.DataDirectory[winc.IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        const relocation_table = @intFromPtr(dll_base) + relocations.VirtualAddress;
-        var relocations_processed: usize = 0;
+        const relocation_table: [*]u8 = @ptrCast(@alignCast(dll_base[relocations.VirtualAddress..]));
+        var relocations_processed: u32 = 0;
 
         while (relocations_processed < relocations.Size) {
-            const relocation_block: *const BASE_RELOCATION_BLOCK = @ptrFromInt(relocation_table + relocations_processed);
+            const relocation_block: *BASE_RELOCATION_BLOCK = @ptrCast(@alignCast(relocation_table[relocations_processed..]));
             relocations_processed += @sizeOf(BASE_RELOCATION_BLOCK);
             const relocations_count = (relocation_block.BlockSize - @sizeOf(BASE_RELOCATION_BLOCK)) / @sizeOf(BASE_RELOCATION_ENTRY);
-            const relocation_entries: [*]const BASE_RELOCATION_ENTRY = @ptrFromInt(relocation_table + relocations_processed);
+            const relocation_entries: [*]align(1) BASE_RELOCATION_ENTRY = @ptrCast(@alignCast(relocation_table[relocations_processed..]));
 
-            var entry_index: usize = 0;
-            while (entry_index < relocations_count) {
+            for (0..relocations_count) |entry_index| {
                 if (relocation_entries[entry_index].Type != 0) {
                     const relocation_rva: usize = relocation_block.PageAddress + relocation_entries[entry_index].Offset;
-                    var address_to_patch: usize = @intFromPtr(dll_base + relocation_rva);
-                    address_to_patch += delta_image_base;
-                    const address_u8_array: [*]u8 = @ptrCast(&address_to_patch);
-                    std.mem.copyForwards(u8, dll_base[relocation_rva .. relocation_rva + 4], address_u8_array[0..4]);
+                    const ptr: *usize = @ptrCast(@alignCast(dll_base[relocation_rva..]));
+                    //log.info("Value before rva is {x} changing to {*}\n", .{ ptr.*, ptr });
+                    ptr.* = ptr.* + delta_image_base;
+
+                    //address_to_patch += delta_image_base;
+
+                } else {
+                    //log.info("Type ABSOLUT offset: {d}\n", .{relocation_entries[entry_index].Offset});
                 }
                 relocations_processed += @sizeOf(BASE_RELOCATION_ENTRY);
-                entry_index += 1;
             }
+            //log.info("block proc\n", .{});
         }
+
+        log.rollbackContext();
 
         try self.ResolveExports(dll_struct);
         try self.LoadedDlls.put(shortlibpath16, dll_struct);
 
+        log.setContext(logtags.ImpRes);
         // resolve import address table
         if (nt_headers.OptionalHeader.DataDirectory[winc.IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress > 0) {
+            log.info(" Resolving imports\n", .{});
             var import_descriptor: *const winc.IMAGE_IMPORT_DESCRIPTOR = @ptrCast(@alignCast(dll_base[nt_headers.OptionalHeader.DataDirectory[winc.IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress..]));
 
             while (import_descriptor.Name != 0) : (import_descriptor = @ptrFromInt(@intFromPtr(import_descriptor) + @sizeOf(winc.IMAGE_IMPORT_DESCRIPTOR))) {
@@ -567,7 +658,6 @@ pub const DllLoader = struct {
                     }
 
                     var thunk: *winc.IMAGE_THUNK_DATA = @ptrCast(@alignCast(dll_base[import_descriptor.FirstThunk..]));
-                    var report_findings = false;
                     import_cycle: while (thunk.u1.AddressOfData != 0) : (thunk = @ptrFromInt(@intFromPtr(thunk) + @sizeOf(winc.IMAGE_THUNK_DATA))) {
                         if (thunk.u1.AddressOfData & 0xf0000000_00000000 != 0) {
                             //No idea wtf is this, but win32u has this ¯\_(ツ)_/¯
@@ -584,7 +674,6 @@ pub const DllLoader = struct {
                             const function_name: *const winc.IMAGE_IMPORT_BY_NAME = @ptrCast(@alignCast(dll_base[thunk.u1.AddressOfData..]));
                             const function_name_realname: [*:0]const u8 = @ptrCast(&function_name.Name);
                             const fname_len = std.mem.len(function_name_realname);
-                            const debug = std.mem.eql(u8, "qsort", function_name_realname[0..fname_len]);
 
                             if (!probably_api_set) {
                                 //const fbytes: [*]const u8 = @ptrCast(library_nameHm.get(function_name_realname[0..fname_len]).?);
@@ -597,17 +686,13 @@ pub const DllLoader = struct {
                                         var some_random_dll = self.LoadedDlls.get(key.*).?.NameExports;
 
                                         if (some_random_dll.get(function_name_realname[0..fname_len])) |func_addr| {
-                                            if (clr.looksLikeAscii(@as([*]const u8, @ptrCast(func_addr))[0..5])) {
-                                                print("[+++] {s}\n", .{function_name_realname});
-                                                if (debug) {
-                                                    print("FindResourceExA baseaddr {*}\n", .{func_addr});
-                                                    for (@as([*]const u8, @ptrCast(func_addr))[0..5]) |c| {
-                                                        print("{c} ", .{c});
-                                                    }
-                                                    print("\n", .{});
-                                                }
+                                            if (clr.looksLikeAscii(@as([*]const u8, @ptrCast(func_addr))[0..10])) {
+                                                log.info("api case - ascii {s} ptr {*} data {s}\n", .{
+                                                    function_name_realname,
+                                                    func_addr,
+                                                    @as([*]const u8, @ptrCast(func_addr))[0..std.mem.len(@as([*:0]const u8, @ptrCast(func_addr)))],
+                                                });
 
-                                                report_findings = true;
                                                 continue;
                                             }
 
@@ -615,7 +700,8 @@ pub const DllLoader = struct {
                                             continue :import_cycle;
                                         }
                                     } else {
-                                        print("NOT FOUND {s}\n", .{function_name_realname});
+                                        log.info("func not found {s}, replacing with UniversalStub\n", .{function_name_realname});
+                                        thunk.u1.Function = @intFromPtr(&UniversalStub);
                                         continue :import_cycle;
                                     }
                                 }
@@ -626,21 +712,29 @@ pub const DllLoader = struct {
             }
         }
 
+        log.rollbackContext();
         // execute the loaded DLL
+        try self.ResolveImportInconsistencies(dll_struct);
+        log.info("fetching ntflush\n", .{});
+        // I dont really know why is this being done, however it is advised to do so
+        // after adding rx\rwx memory to a process
+        // there are opinions that it matters only on some non x86 cpus
+        const NtFlush: *const fn (i32, [*]u8, usize) c_int = @ptrCast(ntdll.get("NtFlushInstructionCache").?);
+        const flush_res = NtFlush(-1, dll_base, virtAllocSize);
+        log.info("Flush result: {}\n", .{flush_res == 0});
 
         if (nt_headers.OptionalHeader.AddressOfEntryPoint != 0) {
             const dll_entry: ?*const DLLEntry = @ptrCast(dll_base[nt_headers.OptionalHeader.AddressOfEntryPoint..]);
             const dll_base_hinstance: win.HINSTANCE = @ptrCast(dll_base);
             if (dll_entry) |runnable_entry| {
-                print("Running the dll  {*}:\n", .{runnable_entry});
-                print16(shortlibpath16);
-                print("Addr off the base addr {x}\n", .{
+                log.info16("Running the dll  {*}", .{runnable_entry}, shortlibpath16);
+                log.info("Addr off the base addr {x}\n", .{
                     nt_headers.OptionalHeader.ImageBase + nt_headers.OptionalHeader.AddressOfEntryPoint,
                 });
                 _ = runnable_entry(dll_base_hinstance, winc.DLL_PROCESS_ATTACH, null);
             }
         }
 
-        return dll_bytes;
+        return dll_base;
     }
 };
